@@ -1,0 +1,9 @@
+{
+  "name": "escm-bench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Untouched Pokemon Showdown Gen 7 referee and differential oracle for escm-bench",
+  "dependencies": {
+    "pokemon-showdown": "0.11.11"
+  }
+}
