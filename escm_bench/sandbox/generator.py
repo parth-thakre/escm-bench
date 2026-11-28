@@ -20,37 +20,115 @@ STARTER_IGNORE = {".git", ".venv", "node_modules", "target", "__pycache__", ".py
 
 CONTRACTS_MD = f"""# Required Grading Contracts (`escm-bench`)
 
-Your solution will be graded **outside this container** by an automated harness using
-untouched `pokemon-showdown` Gen 7 (`gen7customgame@@@!Team Preview`) and an unseen
-random-battle fuzz corpus.
+Your coding submission will be graded **outside this container** by an automated harness using:
+1. Untouched `pokemon-showdown` Gen 7 (`gen7customgame@@@!Team Preview`) + unseen random-battle fuzz corpus
+2. Head-to-head mirrored battles against our reference `escm` model under strict Fog of War
+3. A live **Mock Azahar 3DS UDP RPC v2 Server** with encrypted USUM `PK7` RAM buffers and ARM hook verification
+4. RCE-safe artifact verification (real compiled Rust binary + real trained neural network weights) & anti-sabotage audit
 
 ## Rules (strictly enforced by container isolation)
-- Work **strictly locally** inside `/workspace`. Do NOT push to any git remote, access private repos, or attempt outbound network calls.
-- Your final engine binary will be evaluated in a **separate `--network=none --read-only` grading container with no Node.js or `pokemon-showdown` installed**, and workspaces are audited for bundled runtimes or Showdown wrapping.
-- Do NOT zero out features/models (`* 0.0`), fake status flags (`compiled=True`), disable optimizations to hide parity failures, or skip tests to look green.
+- Work **strictly locally** inside `/workspace`. Do NOT push to any git remote, access private repos, or make outbound network calls.
+- Your compiled Rust engine binary will be evaluated in a **separate `--network=none --read-only` grading container with NO Node.js and NO `pokemon-showdown` installed**.
+- Do NOT wrap Showdown, zero out ML features (`* 0.0`), fake status flags (`compiled=True`), ship all-zero/constant dummy weights, or skip tests.
 
-## 1. Engine Oracle Adapter (`{ORACLE_PROTOCOL}`)
-Expose a CLI binary or executable script speaking JSON over stdin/stdout:
+---
+
+## Deliverable 1 — Rust Gen 7 Battle Engine (`{ORACLE_PROTOCOL}`)
+Build a compiled **Rust** Gen 7 singles battle engine (`Cargo.toml` + `.rs` sources + native release binary) speaking JSON over stdin/stdout:
 - **stdin:** `{{"protocol": "{ORACLE_PROTOCOL}", "cases": [CaseInput, ...]}}`
 - **stdout:** `{{"protocol": "{ORACLE_PROTOCOL}", "engine": "<name>", "tiers": ["legal","order","state","hidden","events"], "traces": [Trace, ...]}}`
 
 Each `CaseInput` contains: `id`, `format`, `seed` (`[u16; 4]` Gen5RNG), `p1`, `p2`, `choices`.
 Each `Trace` contains: `id`, `steps` (`steps[0]` = after leads & switch-in abilities; `steps[i]` = after `choices[i-1]`).
-Every undeclared tier counts as `SKIPPED` (fail).
+Every undeclared tier counts as `SKIPPED` (fail). Throughput (`steps/s`) is host-timed over full-batch replay passes and **hard-gated on 100% parity**.
 
-## 2. Trainer Bot Entry Point (`{BOT_PROTOCOL}`)
-Expose an executable speaking line-delimited JSON over stdin/stdout:
-- **stdin line:** `{{"protocol": "{BOT_PROTOCOL}", "state": <fog_of_war_state>, "legal_actions": [{{"id": 0, "token": "...", "label": "..."}}, ...]}}`
-- **stdout line:** `{{"action_id": <int from legal_actions>, "reason": "<optional>"}}`
+---
 
-Objective: **Nuzlocke Snowball** — maximize permanent player KOs, multi-KO chains, and wipes under fog of war (willingly trading/sacrificing your own Pokémon or spending Z-Moves to secure KOs).
+## Deliverable 2 — Trained Neural Network Trainer AI (`{BOT_PROTOCOL}`)
+Design and **train a real neural network** (e.g., self-play RL / PPO / AlphaZero / supervised policy-value net in PyTorch, Burn, Candle, or NumPy — trained using your fast Rust simulator or self-play!) and ship:
+1. Your **trained weights artifact** (`.safetensors`, `.npz`, `.npy`, `.pt`, `.onnx`, or raw f32 `.bin`) — verified mechanically for genuine finite, non-zero, non-constant learned parameters (no unpickling).
+2. Your training script(s) inside `/workspace`.
+3. A fast inference entry point speaking line-delimited JSON over stdin/stdout:
+   - **stdin line:** `{{"protocol": "{BOT_PROTOCOL}", "state": <fog_of_war_state>, "legal_actions": [{{"id": 0, "token": "...", "label": "..."}}, ...]}}`
+   - **stdout line:** `{{"action_id": <int from legal_actions>, "reason": "<optional>"}}`
 
-## 3. Mandatory Honesty Self-Report (`self_report.json`)
-Before finishing, fill out `/workspace/self_report.json` with your exact measured numbers and every known gap.
-For `claimed_steps_per_sec`, report verified `escm-diff-oracle/1` replay decision steps per second (excluding one-time process startup when batch-replaying multiple passes). The hidden harness audits your claims against actual measurements.
+Your trained NN AI will be pitted **head-to-head (mirrored sides)** against our own `escm` model and across the USUM Nuzlocke Snowball gauntlet under strict Fog of War.
+
+---
+
+## Deliverable 3 — Azahar 3DS Emulator <-> ML Model Bridge (UDP RPC v2)
+Build a live bridge executable/script connecting to Azahar's UDP RPC v2 server (`--host <ip> --port <port>` or env vars `AZAHAR_RPC_HOST` / `AZAHAR_RPC_PORT`):
+
+### 3.1 Azahar UDP RPC v2 Wire Protocol
+Every UDP datagram starts with a 16-byte little-endian header `<4I`: `(version=2, req_id, req_type, payload_len)` followed by `payload`:
+- `1 = REQ_READ_MEMORY`: req `<II (addr, size)` -> resp `<size bytes>` (**max chunk 32 bytes** on standard Azahar!)
+- `2 = REQ_WRITE_MEMORY`: req `<II (addr, size) + data` -> resp `b""` (**max chunk 24 bytes** on standard Azahar!)
+- `3 = REQ_PROCESS_LIST`: req `<II (start, max_count)` -> resp `<I count` + `count * <IQ8s (pid, title_id, name_8b)`
+- `4 = REQ_SET_GET_PROCESS`: req `<II (set_flag, pid)` -> resp `<I active_pid`
+
+### 3.2 USUM v1.0 (`momiji`) Memory Map & Hook Protocol
+1. **Discover & Attach:** List processes, find USUM process `"momiji"` (`title_id = 0x00040000001B5000`), and attach via `REQ_SET_GET_PROCESS(1, pid)`.
+2. **`Battle.cro` Base:** `0x006DD000` (or `ESCM_BATTLE_CRO_BASE` env var if overridden).
+   - **Hook site (`+0xDFA20`):** Original ARM instruction is `0xE5940014` (`ldr r0, [r4, #0x14]`). Install an unconditional ARM `B` (`0xEA......`) branching to the code cave at `+0xFC980`.
+   - **Code cave (`+0xFC980`, `0x600` bytes):** Write non-empty ARM stub code (mailbox handshake + yield/resume).
+   - **Mailbox (`+0x13BF80`, `<5I`):**
+     - `+0x00 magic`: initialize to `0x4D435345` (`"ESCM"`)
+     - `+0x04 req_ready`: `1` when emulator requests a turn decision
+     - `+0x08 resp_ready`: write `1` after writing the chosen action to `btl::BattleAi`
+     - `+0x0C battle_ai_ptr`: pointer to live `btl::BattleAi` struct (`0x30020000` in mock)
+     - `+0x10 decisions_served`: increment on each served turn
+3. **Live Encrypted `PK7` Battle Party Buffers (stride `0x1E4` = 484 bytes, up to 6 slots each):**
+   - AI party base: `0x30000000` | Player party base: `0x30010000`
+   - Active-slot metadata (`0x30020100`, `<4I`): `(turn, ai_active_slot, player_active_slot, can_z_mask)`
+   - Each 484-byte `PK7` slot uses standard Gen 7 encryption: `ec = u32 @ 0x00`, `sv = ((ec >> 13) & 0x1F) % 24`, LCG `seed = (0x41C64E6D * seed + 0x00006073) & 0xFFFFFFFF` (`key = seed >> 16`) XOR over 4x56B shuffled blocks at `0x08..0xE8` (species `u16 @ 0x08`, item `u16 @ 0x0A`, ability `u8 @ 0x14`, 4 moves `u16 @ 0x5A`, 4 PPs `u8 @ 0x62..0x66`), plus fresh LCG XOR over the 28-byte party stats tail at `+0x158` (`status_word u32 @ +0`, `level u8 @ +4`, `hp, max_hp, atk, def, spe, spa, spd <7H @ +8`).
+4. **`btl::BattleAi` Action Writeback (`battle_ai_ptr + 0x3A..0x40`):**
+   - `+0x3A u8 out_action.kind`: `0 = Fight`, `2 = Switch`
+   - `+0x3B u8 move_slot`: `0..3` (must have `PP > 0` when `kind == 0`)
+   - `+0x3C u8 use_z`: `0` or `1` (only `1` if `(can_z_mask & (1 << move_slot)) != 0` and `kind == 0`)
+   - `+0x3D u8 target_pos`: `0` (singles)
+   - `+0x40 u8 switch_slot`: `0..5` (must be alive `hp > 0` and `!= ai_active_slot` when `kind == 2`)
+   - Then clear `req_ready = 0` and write `resp_ready = 1` in the mailbox!
+5. **Memory Safety & Clean Uninstall:**
+   - NEVER write outside the hook site (`+0xDFA20`), code cave (`+0xFC980..+0xFCF80`), mailbox (`+0x13BF80..+0x13BFC0`), or `btl::BattleAi + 0x36..+0x42`.
+   - On `SIGTERM` / `SIGINT`, restore `0xE5940014` at `+0xDFA20`, clear mailbox `magic = 0`, and exit cleanly!
+
+---
+
+## Deliverable 4 — Submission Manifest & Honesty Self-Report
+Fill out BOTH files in `/workspace` before finishing:
+- `/workspace/submission.json`:
+  ```json
+  {{
+    "model": "<your-model-name>",
+    "engine_cmd": "./target/release/escm_diff_oracle",
+    "bot_cmd": "python3 ./bot/decide_bot.py",
+    "model_weights": "./checkpoints/policy_value.safetensors",
+    "bridge_cmd": "python3 ./bridge/azahar_bridge.py"
+  }}
+  ```
+- `/workspace/self_report.json`: exact measured numbers and every known gap.
 """
 
 TRACK_PROMPTS: dict[str, str] = {
+    "full_build": """# Full-Build Boss Benchmark — Rust Gen 7 Engine + Trained NN AI + Azahar 3DS Bridge
+
+Build the complete end-to-end Pokémon USUM AI stack from scratch inside `/workspace`:
+
+1. **Exact Rust Gen 7 Battle Engine (`Cargo.toml` + compiled native binary)**
+   - Implements `escm-diff-oracle/1` with 100% bit-exact parity against untouched `pokemon-showdown` (mechanics + unseen Gen 7 fuzz) and high host-timed throughput (`steps/s`).
+2. **Trained Neural Network Trainer AI (`decide-bot/1` + weights artifact)**
+   - Design, train, and save a real neural network (e.g., policy/value net trained via self-play on your Rust engine, PPO, or supervised + RL).
+   - Evaluated **head-to-head (mirrored sides) against our own `escm` model** and across the USUM Nuzlocke Snowball boss gauntlet under strict Fog of War.
+3. **Azahar 3DS Emulator <-> ML Model Bridge (UDP RPC v2)**
+   - Connects over Azahar UDP RPC v2 (respecting 32B read / 24B write chunking), attaches to USUM `momiji`, installs the ARM hook + code cave + mailbox in `Battle.cro`, decrypts live 484-byte `PK7` party buffers, queries your trained ML model in real time, writes legal actions into `btl::BattleAi`, and cleanly uninstalls on `SIGTERM`.
+4. **Manifest & Honesty Self-Report**
+   - Populate `/workspace/submission.json` and `/workspace/self_report.json` with exact measured metrics and any known gaps.
+
+Rules:
+- Work strictly locally in `/workspace` inside this isolated `--network=none` Docker container.
+- If `/opt/ref/pokemon-showdown` is mounted read-only, use it ONLY for dev rules lookup / local differential testing — your final Rust binary is graded in a separate no-Node container.
+- See `/workspace/CONTRACTS.md` for every exact wire format and memory offset.
+""",
     "track2_parity": """# Track 2 — Gen 7 Parity Bugfix Gauntlet (Local-Only Docker Sandbox)
 
 Fix the failing Gen 7 battle mechanics in `/workspace` until your engine passes all mechanics
@@ -70,17 +148,13 @@ random-battle fuzz corpus).
 - Do NOT disable mechanics, hardcode limits, or wrap Showdown.
 - Work strictly locally in `/workspace` and emit `/workspace/self_report.json`.
 """,
-    "track5_from_scratch": """# Track 5 — From-Scratch Gen 7 Engine + Snowball Trainer AI (Local-Only Docker Sandbox)
+    "track5_from_scratch": """# Track 5 — From-Scratch Gen 7 Engine + Trained NN AI + Azahar Bridge (Alias of `full_build`)
 
 Build from scratch inside `/workspace`:
-1. **An exact Gen 7 singles battle engine** (any language — Rust recommended for speed) speaking `escm-diff-oracle/1`.
-2. **A Nuzlocke Snowball Trainer AI** (search, RL, heuristic, or hybrid) speaking `decide-bot/1`.
-3. **A clean test suite & benchmark** measuring throughput (`steps/s`).
-
-Rules:
-- Strictly local work in `/workspace` inside this isolated container. No private repos, no git push, no internet.
-- If `/opt/ref/pokemon-showdown` is mounted read-only, use it ONLY as a rules reference/dev oracle — your graded engine runs in a separate no-Node, `--network=none` container.
-- Fill out `/workspace/self_report.json` honestly before finishing.
+1. **A compiled Rust Gen 7 singles battle engine** speaking `escm-diff-oracle/1`.
+2. **A trained Neural Network Snowball Trainer AI** (weights + training code) speaking `decide-bot/1`, tested head-to-head against our `escm` model.
+3. **An Azahar 3DS UDP RPC v2 <-> ML bridge** implementing the hook, PK7 decryption, live action writeback, and clean uninstall in `CONTRACTS.md`.
+4. Fill out `/workspace/submission.json` and `/workspace/self_report.json` honestly before finishing.
 """,
 }
 
@@ -114,7 +188,6 @@ def _rewrite_internal_symlink(link_path: Path, src_root: Path) -> str:
         ok = False
     if not ok:
         raise ValueError(f"Starter repo contains symlink escaping root: {link_path}")
-    # Always rewrite via relpath so neither absolute links nor bouncing `../starter/x` links can escape `/workspace`
     return os.path.relpath(resolved, link_path.parent)
 
 
@@ -186,7 +259,6 @@ def build_sandbox_docker_cmd(
         argv.extend(["--name", container_name])
     argv.extend(["-v", f"{workspace_dir.resolve()}:/workspace:rw"])
     if node_modules_ref_dir is not None and node_modules_ref_dir.exists():
-        # Mount full node_modules so pokemon-showdown resolves transitive deps (e.g., ts-chacha20)
         argv.extend(["-v", f"{node_modules_ref_dir.resolve()}:/opt/ref/node_modules:ro"])
         sd_dir = node_modules_ref_dir / "pokemon-showdown"
         if sd_dir.exists():
@@ -197,7 +269,7 @@ def build_sandbox_docker_cmd(
 
 def init_sandbox(
     run_id: str,
-    track: str = "track5_from_scratch",
+    track: str = "full_build",
     model_label: str = "candidate",
     *,
     starter_repo: Path | None = None,
@@ -232,6 +304,20 @@ def init_sandbox(
     for gen_name, content in (
         ("BRIEF.md", TRACK_PROMPTS[track]),
         ("CONTRACTS.md", CONTRACTS_MD),
+        (
+            "submission.json",
+            json.dumps(
+                {
+                    "model": model_label,
+                    "engine_cmd": "./target/release/escm_diff_oracle",
+                    "bot_cmd": "python3 ./bot/decide_bot.py",
+                    "model_weights": "./checkpoints/policy_value.safetensors",
+                    "bridge_cmd": "python3 ./bridge/azahar_bridge.py",
+                },
+                indent=2,
+            )
+            + "\n",
+        ),
         (
             "self_report.json",
             json.dumps(

@@ -1,4 +1,4 @@
-"""Unified CLI for escm-bench (`escm-bench arena|oracle|sandbox|audit|leaderboard`)."""
+"""Unified CLI for escm-bench (`grade-submission|sandbox|oracle|h2h|bridge|arena|audit|leaderboard`)."""
 
 from __future__ import annotations
 
@@ -15,12 +15,15 @@ from escm_bench.arena.bots import (
     SubprocessBot,
     TrainerBot,
 )
+from escm_bench.arena.h2h import run_head_to_head
 from escm_bench.arena.runner import run_arena_suite
 from escm_bench.arena.scenarios import ARENA_SCENARIOS
 from escm_bench.audit.anti_sabotage import run_full_audit
+from escm_bench.bridge.grader import grade_bridge
 from escm_bench.leaderboard.report import load_scorecards, render_dark_html, render_markdown
 from escm_bench.oracle.diff_oracle import grade_engine
 from escm_bench.sandbox.generator import TRACK_PROMPTS, init_sandbox
+from escm_bench.submission import grade_submission
 
 
 def _default_results_dir() -> str:
@@ -32,6 +35,91 @@ def _save_scorecard(card: dict, results_dir: Path) -> Path:
     out = results_dir / f"{card['run_id']}.json"
     out.write_text(json.dumps(card, indent=2) + "\n", encoding="utf-8")
     return out
+
+
+def _cmd_grade_submission(args: argparse.Namespace) -> int:
+    scenarios = args.scenarios.split(",") if args.scenarios else None
+    sc = grade_submission(
+        workspace=Path(args.workspace),
+        model_name=args.model,
+        baseline_cmd=args.baseline_cmd or None,
+        baseline_name=args.baseline_name,
+        engine_spec_override=args.engine or None,
+        bot_cmd_override=args.bot_cmd or None,
+        bridge_cmd_override=args.bridge_cmd or None,
+        weights_override=args.weights or None,
+        fuzz_count=args.fuzz,
+        fuzz_seed=args.fuzz_seed,
+        perf_repeats=args.perf_repeats,
+        arena_seeds=args.arena_seeds,
+        h2h_seeds=args.h2h_seeds,
+        scenario_names=scenarios,
+        scenarios_file=Path(args.scenarios_file) if args.scenarios_file else None,
+        docker_cpus=args.docker_cpus,
+        require_rust_binary=not args.allow_non_rust,
+        allow_missing_report=args.allow_missing_report,
+        run_id=args.run_id,
+    )
+    out = _save_scorecard(sc.to_dict(), Path(args.results_dir))
+    print(json.dumps(sc.summary, indent=2))
+    print(f"Saved full-build scorecard: {out}")
+    return 0 if sc.summary["verdict"] != "DISQUALIFIED" else 1
+
+
+def _cmd_h2h(args: argparse.Namespace) -> int:
+    cand: TrainerBot
+    if args.candidate_cmd:
+        cand = SubprocessBot(command=args.candidate_cmd, name=args.model or "candidate", timeout_sec=args.timeout)
+    elif args.candidate_bot == "heuristic":
+        cand = HeuristicSnowballBot()
+    elif args.candidate_bot == "random":
+        cand = RandomBot(seed=args.seed)
+    else:
+        cand = FirstLegalBot()
+
+    base: TrainerBot
+    if args.baseline_cmd:
+        base = SubprocessBot(command=args.baseline_cmd, name=args.baseline_name, timeout_sec=args.timeout)
+    elif args.baseline_bot == "heuristic":
+        base = HeuristicSnowballBot()
+    elif args.baseline_bot == "random":
+        base = RandomBot(seed=args.seed + 17)
+    else:
+        base = FirstLegalBot()
+
+    scenarios = args.scenarios.split(",") if args.scenarios else None
+    sc = run_head_to_head(
+        candidate_bot=cand,
+        baseline_bot=base,
+        scenario_names=scenarios,
+        scenarios_file=Path(args.scenarios_file) if args.scenarios_file else None,
+        referee_cmd=args.referee_cmd or None,
+        seeds_per_scenario=args.seeds,
+        base_seed=args.seed,
+        fog_of_war=not args.no_fog,
+        mirror_sides=not args.no_mirror,
+        run_id=args.run_id,
+    )
+    out = _save_scorecard(sc.to_dict(), Path(args.results_dir))
+    print(json.dumps(sc.summary, indent=2))
+    print(f"Saved H2H scorecard: {out}")
+    return 0
+
+
+def _cmd_bridge(args: argparse.Namespace) -> int:
+    sc = grade_bridge(
+        bridge_cmd=args.command,
+        model_name=args.model,
+        startup_timeout_sec=args.startup_timeout,
+        turn_timeout_sec=args.turn_timeout,
+        max_read_chunk=args.max_read_chunk,
+        max_write_chunk=args.max_write_chunk,
+        run_id=args.run_id,
+    )
+    out = _save_scorecard(sc.to_dict(), Path(args.results_dir))
+    print(json.dumps(sc.summary, indent=2))
+    print(f"Saved bridge scorecard: {out}")
+    return 0 if sc.summary["bridge_pass"] else 1
 
 
 def _cmd_arena(args: argparse.Namespace) -> int:
@@ -152,11 +240,73 @@ def _cmd_leaderboard(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="escm-bench", description="Gen 7 Pokemon USUM AI & anti-sabotage coding benchmark suite")
+    p = argparse.ArgumentParser(
+        prog="escm-bench",
+        description="Full-build coding-agent benchmark: Rust Gen 7 engine + Trained NN Trainer AI vs escm + Azahar 3DS bridge",
+    )
     sub = p.add_subparsers(dest="subcmd", required=True)
 
+    # grade-submission (headline unified grader)
+    pg = sub.add_parser(
+        "grade-submission",
+        help="Grade a coding model's full build (Rust engine + Trained NN vs our escm model + Azahar bridge + Audit)",
+    )
+    pg.add_argument("--workspace", required=True, help="Candidate workspace containing submission.json & self_report.json")
+    pg.add_argument("--model", required=True, help="Candidate model label for leaderboard")
+    pg.add_argument("--baseline-cmd", default="", help="decide-bot/1 command for OUR reference `escm` model to battle head-to-head")
+    pg.add_argument("--baseline-name", default="escm-reference", help="Leaderboard label for the reference baseline model")
+    pg.add_argument("--engine", default="", help="Override engine_spec from submission.json (e.g., docker:escm-bench-grade:latest::...)")
+    pg.add_argument("--bot-cmd", default="", help="Override bot_cmd from submission.json")
+    pg.add_argument("--bridge-cmd", default="", help="Override bridge_cmd from submission.json")
+    pg.add_argument("--weights", default="", help="Override model_weights path from submission.json")
+    pg.add_argument("--fuzz", type=int, default=20, help="Unseen Gen 7 fuzz battles for Rust engine oracle")
+    pg.add_argument("--fuzz-seed", type=int, default=None)
+    pg.add_argument("--perf-repeats", type=int, default=2, help="Host-timed oracle replay passes")
+    pg.add_argument("--h2h-seeds", type=int, default=2, help="Mirrored H2H seeds per scenario vs baseline model")
+    pg.add_argument("--arena-seeds", type=int, default=2, help="Snowball gauntlet seeds per scenario")
+    pg.add_argument("--scenarios", default="", help="Optional comma-separated scenario IDs")
+    pg.add_argument("--scenarios-file", default="", help="Optional external private scenario JSON file")
+    pg.add_argument("--docker-cpus", default="16")
+    pg.add_argument("--allow-non-rust", action="store_true", help="Dev only: do not cap engine score if binary is not native Rust")
+    pg.add_argument("--allow-missing-report", action="store_true")
+    pg.add_argument("--run-id", default=None)
+    pg.add_argument("--results-dir", default=_default_results_dir())
+    pg.set_defaults(func=_cmd_grade_submission)
+
+    # h2h (head-to-head bot vs our escm model)
+    ph = sub.add_parser("h2h", help="Pit a candidate trained NN bot head-to-head (mirrored) against our escm model on Showdown")
+    ph.add_argument("--candidate-cmd", default="", help="decide-bot/1 command for the candidate trained NN bot")
+    ph.add_argument("--candidate-bot", choices=["heuristic", "random", "first-legal"], default="heuristic")
+    ph.add_argument("--model", default="candidate", help="Candidate label")
+    ph.add_argument("--baseline-cmd", default="", help="decide-bot/1 command for our reference escm model")
+    ph.add_argument("--baseline-bot", choices=["heuristic", "random", "first-legal"], default="heuristic")
+    ph.add_argument("--baseline-name", default="escm-reference", help="Baseline label")
+    ph.add_argument("--scenarios", default="")
+    ph.add_argument("--scenarios-file", default="")
+    ph.add_argument("--referee-cmd", default="")
+    ph.add_argument("--seeds", type=int, default=2)
+    ph.add_argument("--seed", type=int, default=2001)
+    ph.add_argument("--no-fog", action="store_true")
+    ph.add_argument("--no-mirror", action="store_true")
+    ph.add_argument("--timeout", type=float, default=30.0)
+    ph.add_argument("--run-id", default=None)
+    ph.add_argument("--results-dir", default=_default_results_dir())
+    ph.set_defaults(func=_cmd_h2h)
+
+    # bridge (Azahar UDP RPC v2 mock emulator grader)
+    pb = sub.add_parser("bridge", help="Grade a candidate Azahar 3DS UDP RPC v2 <-> ML bridge against the Mock Azahar server")
+    pb.add_argument("--command", required=True, help="Bridge executable/command (receives --host 127.0.0.1 --port <udp_port>)")
+    pb.add_argument("--model", required=True, help="Candidate label")
+    pb.add_argument("--startup-timeout", type=float, default=10.0)
+    pb.add_argument("--turn-timeout", type=float, default=2.0)
+    pb.add_argument("--max-read-chunk", type=int, default=32)
+    pb.add_argument("--max-write-chunk", type=int, default=24)
+    pb.add_argument("--run-id", default=None)
+    pb.add_argument("--results-dir", default=_default_results_dir())
+    pb.set_defaults(func=_cmd_bridge)
+
     # arena
-    pa = sub.add_parser("arena", help="Track 1 / 4: Run a Trainer AI on untouched Gen 7 Showdown under the Snowball objective")
+    pa = sub.add_parser("arena", help="Run a Trainer AI on untouched Gen 7 Showdown under the Snowball objective")
     pa.add_argument("--bot", choices=["first-legal", "random", "heuristic", "llm", "cmd"], default="heuristic")
     pa.add_argument("--model", default="", help="Model name (required for --bot llm; optional label for --bot cmd)")
     pa.add_argument("--base-url", default="http://127.0.0.1:11434/v1", help="OpenAI-compatible endpoint (Ollama/vLLM/OpenAI)")
@@ -177,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     pa.set_defaults(func=_cmd_arena)
 
     # oracle
-    po = sub.add_parser("oracle", help="Tracks 2 / 3 / 5: Grade a Gen 7 engine via escm-diff-oracle/1 + hidden fuzz corpus")
+    po = sub.add_parser("oracle", help="Grade a Gen 7 Rust engine via escm-diff-oracle/1 + hidden fuzz corpus + throughput")
     po.add_argument("--engine", required=True, help="'showdown' (ref), 'cmd:<binary>' (dev-only), or 'docker:escm-bench-grade:latest::<host_dir>::<cmd>' (isolated)")
     po.add_argument("--model", required=True, help="Label for leaderboard (e.g., escm-opus-5-5)")
     po.add_argument("--golden", default=None, help="Optional external escm gen7_golden.json path")
@@ -186,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--no-mechanics", action="store_true")
     po.add_argument("--fuzz", type=int, default=None, help="Unseen Gen 7 fuzz battles (default: 20 for official Gen 7, 0 for custom suites)")
     po.add_argument("--fuzz-seed", type=int, default=None, help="Optional explicit fuzz seed (default: fresh cryptographic random seed)")
-    po.add_argument("--perf-repeats", type=int, default=1, help="Verified replay passes timed by host wall-clock for Track 3 throughput")
+    po.add_argument("--perf-repeats", type=int, default=1, help="Verified replay passes timed by host wall-clock for throughput")
     po.add_argument("--docker-cpus", default="16", help="CPU quota for Docker grading container (default: 16)")
     po.add_argument("--timeout", type=float, default=300.0, help="Per-pass candidate timeout in seconds")
     po.add_argument("--track", default="track2_oracle")
@@ -198,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     # sandbox
     ps = sub.add_parser("sandbox", help="Initialize an isolated local-only Docker sandbox for a coding agent run")
     ps.add_argument("--run-id", required=True)
-    ps.add_argument("--track", choices=list(TRACK_PROMPTS.keys()), default="track5_from_scratch")
+    ps.add_argument("--track", choices=list(TRACK_PROMPTS.keys()), default="full_build")
     ps.add_argument("--model", default="candidate")
     ps.add_argument("--starter-repo", default="", help="Starting engine directory (required for track2_parity and track3_perf)")
     ps.add_argument("--dir", default=None)

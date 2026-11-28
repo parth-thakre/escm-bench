@@ -292,17 +292,17 @@ function choosePlayerAction(battle, policy, rng) {
 }
 
 /**
- * Filter raw Showdown log to p1's legal perspective:
- * - For `|split|p1`, keep the private p1 line (next line) and skip the public line.
- * - For `|split|p2` (or any other side), skip the private exact-HP line and keep ONLY the public % line.
+ * Filter raw Showdown log to a given side's legal perspective ("p1" or "p2"):
+ * - For `|split|<viewerSide>`, keep the private line (next line) and skip the public line.
+ * - For `|split|<oppSide>`, skip the private exact-HP line and keep ONLY the public % line.
  */
-function maskP2ExactHp(line) {
-  // Scrub any exact p2 HP fraction (e.g. `95/135`) down to percentage (`71/100`) under fog of war
+function maskOppExactHp(line, oppSideTag) {
+  // Scrub any exact opponent HP fraction (e.g. `95/135`) down to percentage (`71/100`) under fog of war
   const parts = line.split("|");
   if (parts.length < 4) return line;
   const cmd = parts[1];
   const target = parts[2] || "";
-  if (!target.startsWith("p2")) return line;
+  if (!target.startsWith(oppSideTag)) return line;
   const hpIdx = cmd === "switch" || cmd === "drag" || cmd === "replace" ? 4 : 3;
   if (parts.length <= hpIdx) return line;
   parts[hpIdx] = parts[hpIdx].replace(/^(\d+)\/(\d+)/, (_, curStr, maxStr) => {
@@ -315,7 +315,8 @@ function maskP2ExactHp(line) {
   return parts.join("|");
 }
 
-function filterLogForP1(rawLog, fogOfWar) {
+function filterLogForSide(rawLog, viewerSideTag, fogOfWar) {
+  const oppSideTag = viewerSideTag === "p1" ? "p2" : "p1";
   const out = [];
   for (let i = 0; i < rawLog.length; i++) {
     const line = rawLog[i];
@@ -325,28 +326,30 @@ function filterLogForP1(rawLog, fogOfWar) {
       const targetSide = line.slice("|split|".length).trim();
       const privLine = rawLog[i + 1] || "";
       const pubLine = rawLog[i + 2] || "";
-      if (!fogOfWar || targetSide === "p1") {
+      if (!fogOfWar || targetSide === viewerSideTag) {
         if (privLine.startsWith("|")) out.push(privLine);
       } else {
-        if (pubLine.startsWith("|")) out.push(maskP2ExactHp(pubLine));
+        if (pubLine.startsWith("|")) out.push(maskOppExactHp(pubLine, oppSideTag));
       }
       i += 2;
       continue;
     }
-    out.push(fogOfWar ? maskP2ExactHp(line) : line);
+    out.push(fogOfWar ? maskOppExactHp(line, oppSideTag) : line);
   }
   return out;
 }
 
 class FogTracker {
-  constructor(battle) {
-    this.revealedIds = new Set(); // stable _benchId of p2 mons revealed
+  constructor(battle, oppSideIdx = 1) {
+    this.oppSideIdx = oppSideIdx;
+    this.oppSideTag = oppSideIdx === 0 ? "p1" : "p2";
+    this.revealedIds = new Set(); // stable _benchId of opponent mons revealed
     this.revealedMoves = new Map(); // _benchId -> Set(moveId)
     this.revealedItems = new Map(); // _benchId -> string
     this.revealedAbilities = new Map(); // _benchId -> string
-    this.activeP2BenchId = null;
+    this.activeOppBenchId = null;
     this.lastLogIdx = 0;
-    for (const p of battle.sides[1].pokemon) {
+    for (const p of battle.sides[this.oppSideIdx].pokemon) {
       this.revealedMoves.set(p._benchId, new Set());
     }
   }
@@ -357,18 +360,17 @@ class FogTracker {
     return m ? { side: m[1], nick: m[2].trim() } : null;
   }
 
-  _findP2ByNick(battle, nick, preferActiveBenchId = null) {
+  _findOppByNick(battle, nick, preferActiveBenchId = null) {
     if (!nick) return null;
-    const p2 = battle.sides[1];
-    const matches = p2.pokemon.filter((p) => p.name === nick);
+    const opp = battle.sides[this.oppSideIdx];
+    const matches = opp.pokemon.filter((p) => p.name === nick);
     if (matches.length === 0) return null;
     if (matches.length === 1) return matches[0];
     if (preferActiveBenchId !== null) {
       const activeMatch = matches.find((p) => p._benchId === preferActiveBenchId);
       if (activeMatch) return activeMatch;
     }
-    // Prefer a currently active mon on the last switch, or an unrevealed mon on a new switch
-    const curAct = p2.active[0];
+    const curAct = opp.active[0];
     const curVis = curAct ? (curAct.illusion || curAct) : null;
     if (curVis && curVis.name === nick) return curVis;
     return matches.find((p) => !this.revealedIds.has(p._benchId)) || matches[0];
@@ -376,17 +378,17 @@ class FogTracker {
 
   _resolveActorBenchId(battle, field, isSwitchEvent = false) {
     const parsed = this._extractSideAndNick(field);
-    if (!parsed || parsed.side !== "p2") return null;
-    if (!isSwitchEvent && this.activeP2BenchId !== null) {
-      const cur = battle.sides[1].pokemon.find((p) => p._benchId === this.activeP2BenchId);
+    if (!parsed || parsed.side !== this.oppSideTag) return null;
+    if (!isSwitchEvent && this.activeOppBenchId !== null) {
+      const cur = battle.sides[this.oppSideIdx].pokemon.find((p) => p._benchId === this.activeOppBenchId);
       if (cur && cur.name === parsed.nick) return cur._benchId;
     }
-    const mon = this._findP2ByNick(battle, parsed.nick, isSwitchEvent ? null : this.activeP2BenchId);
+    const mon = this._findOppByNick(battle, parsed.nick, isSwitchEvent ? null : this.activeOppBenchId);
     return mon ? mon._benchId : null;
   }
 
   sync(battle) {
-    const p2 = battle.sides[1];
+    const opp = battle.sides[this.oppSideIdx];
     for (let i = this.lastLogIdx; i < battle.log.length; i++) {
       const line = battle.log[i];
       if (!line || !line.startsWith("|")) continue;
@@ -400,19 +402,19 @@ class FogTracker {
 
       if (cmd === "switch" || cmd === "drag" || cmd === "replace") {
         const parsed = this._extractSideAndNick(parts[2]);
-        if (parsed && parsed.side === "p2") {
-          const matches = p2.pokemon.filter((p) => p.name === parsed.nick);
+        if (parsed && parsed.side === this.oppSideTag) {
+          const matches = opp.pokemon.filter((p) => p.name === parsed.nick);
           let chosen = null;
           if (matches.length === 1) {
             chosen = matches[0];
           } else if (matches.length > 1) {
-            // Avoid re-picking the mon that just switched out when two p2 mons share a nickname
-            chosen = matches.find((p) => p._benchId !== this.activeP2BenchId && !p.fainted)
-              || matches.find((p) => p._benchId !== this.activeP2BenchId)
+            // Avoid re-picking the mon that just switched out when two opponent mons share a nickname
+            chosen = matches.find((p) => p._benchId !== this.activeOppBenchId && !p.fainted)
+              || matches.find((p) => p._benchId !== this.activeOppBenchId)
               || matches[0];
           }
           if (chosen) {
-            this.activeP2BenchId = chosen._benchId;
+            this.activeOppBenchId = chosen._benchId;
             this.revealedIds.add(chosen._benchId);
           }
         }
@@ -437,7 +439,7 @@ class FogTracker {
         this.revealedItems.set(targetBenchId, parts[3] || "consumed");
       }
 
-      // Attribute `[from] ability: <Name>` to `[of] pXa: Nick` if present (otherwise to parts[2]), ONLY if p2
+      // Attribute `[from] ability: <Name>` to `[of] pXa: Nick` if present (otherwise to parts[2]), ONLY if oppSide
       let fromAbility = null;
       let ofField = null;
       for (let k = 3; k < parts.length; k++) {
@@ -458,10 +460,10 @@ class FogTracker {
       }
     }
     this.lastLogIdx = battle.log.length;
-    const act = p2.active[0];
+    const act = opp.active[0];
     if (act) {
       const vis = act.illusion || act;
-      this.activeP2BenchId = vis._benchId;
+      this.activeOppBenchId = vis._benchId;
       this.revealedIds.add(vis._benchId);
     }
   }
@@ -471,10 +473,10 @@ function chainValue(kos) {
   return kos * Math.max(0, kos - 1) * 0.5 * REWARD_CFG.snowballChainBonus;
 }
 
-function battlePressure(battle) {
+function battlePressure(battle, scorerSideIdx = 0) {
   if (battle.ended) return 0.0;
-  const ai = battle.sides[0];
-  const pl = battle.sides[1];
+  const ai = battle.sides[scorerSideIdx];
+  const pl = battle.sides[1 - scorerSideIdx];
   let aiHpSum = 0;
   for (const p of ai.pokemon) {
     if (!p.fainted && p.hp > 0) aiHpSum += p.hp / Math.max(1, p.maxhp);
@@ -493,8 +495,8 @@ function battlePressure(battle) {
   return Math.max(-2.0, Math.min(2.0, pressure));
 }
 
-function snapReward(battle) {
-  const pl = battle.sides[1];
+function snapReward(battle, scorerSideIdx = 0) {
+  const pl = battle.sides[1 - scorerSideIdx];
   const aliveById = {};
   let plKos = 0;
   let plAlive = 0;
@@ -509,7 +511,7 @@ function snapReward(battle) {
     plKos,
     plAlive,
     aliveById,
-    pressure: battlePressure(battle),
+    pressure: battlePressure(battle, scorerSideIdx),
   };
 }
 
@@ -531,9 +533,10 @@ function computeStepReward(prev, next) {
   return eventRew + shaping - REWARD_CFG.turnPenalty;
 }
 
-function projectState(battle, fog, fogOfWar) {
-  const ai = battle.sides[0];
-  const pl = battle.sides[1];
+function projectStateForSide(battle, viewerSideIdx, oppFog, fogOfWar) {
+  const viewerTag = viewerSideIdx === 0 ? "p1" : "p2";
+  const ai = battle.sides[viewerSideIdx];
+  const pl = battle.sides[1 - viewerSideIdx];
   const aiAct = ai.active[0];
   const plAct = pl.active[0];
 
@@ -562,7 +565,7 @@ function projectState(battle, fog, fogOfWar) {
   const formatPlayerMon = (p) => {
     const disguised = Boolean(fogOfWar && p.isActive && p.illusion);
     const vis = disguised ? p.illusion : p;
-    const revealedMoves = Array.from(fog.revealedMoves.get(vis._benchId) || []);
+    const revealedMoves = Array.from(oppFog.revealedMoves.get(vis._benchId) || []);
     return {
       species: vis.species.name,
       level: vis.level,
@@ -573,8 +576,8 @@ function projectState(battle, fog, fogOfWar) {
       status: p.status || null,
       boosts: p.isActive ? nonZeroBoosts(p.boosts) : {},
       revealed_moves: fogOfWar ? revealedMoves : p.moveSlots.map((m) => m.id),
-      revealed_item: fogOfWar ? (fog.revealedItems.get(vis._benchId) || null) : (p.item || null),
-      revealed_ability: fogOfWar ? (disguised ? null : (fog.revealedAbilities.get(p._benchId) || null)) : (p.ability || null),
+      revealed_item: fogOfWar ? (oppFog.revealedItems.get(vis._benchId) || null) : (p.item || null),
+      revealed_ability: fogOfWar ? (disguised ? null : (oppFog.revealedAbilities.get(p._benchId) || null)) : (p.ability || null),
     };
   };
 
@@ -583,12 +586,11 @@ function projectState(battle, fog, fogOfWar) {
   for (const p of pl.pokemon) {
     if (fogOfWar) {
       if (p.isActive && p.illusion) {
-        // Project active mon under its Illusion identity without adding both Zoroark and its disguise
         plTeam.push(formatPlayerMon(p));
         seenBenchIds.add(p.illusion._benchId);
         continue;
       }
-      if (!p.isActive && !fog.revealedIds.has(p._benchId)) {
+      if (!p.isActive && !oppFog.revealedIds.has(p._benchId)) {
         continue;
       }
       if (seenBenchIds.has(p._benchId)) continue;
@@ -604,6 +606,7 @@ function projectState(battle, fog, fogOfWar) {
     turn: battle.turn,
     ended: Boolean(battle.ended),
     fog_of_war: fogOfWar,
+    viewer_side: viewerTag,
     field: {
       weather: battle.field.weather || null,
       terrain: battle.field.terrain || null,
@@ -618,7 +621,7 @@ function projectState(battle, fog, fogOfWar) {
     player_unrevealed_bench_count: hiddenBenchCount,
     player_alive_count: pl.pokemon.filter((p) => !p.fainted && p.hp > 0).length,
     player_total_count: pl.pokemon.length,
-    recent_log: filterLogForP1(battle.log, fogOfWar).slice(-14),
+    recent_log: filterLogForSide(battle.log, viewerTag, fogOfWar).slice(-14),
   };
 }
 
@@ -643,14 +646,77 @@ function getMetrics(battle, totalReward) {
   };
 }
 
+function getH2HMetrics(battle, totalRewP1, totalRewP2) {
+  const s1 = battle.sides[0];
+  const s2 = battle.sides[1];
+  const p2Kos = s2.pokemon.filter((p) => p.fainted || p.hp <= 0).length; // KOs inflicted BY p1
+  const p1Kos = s1.pokemon.filter((p) => p.fainted || p.hp <= 0).length; // KOs inflicted BY p2
+  let winnerSide = null;
+  if (battle.winner === "P1") winnerSide = "p1";
+  else if (battle.winner === "P2") winnerSide = "p2";
+  return {
+    turn: battle.turn,
+    ended: Boolean(battle.ended),
+    winner: winnerSide,
+    p1_kos_inflicted: p2Kos,
+    p2_kos_inflicted: p1Kos,
+    p1_team_size: s1.pokemon.length,
+    p2_team_size: s2.pokemon.length,
+    p1_wiped_opp: p2Kos === s2.pokemon.length,
+    p2_wiped_opp: p1Kos === s1.pokemon.length,
+    p1_snowball_reward: Number(totalRewP1.toFixed(4)),
+    p2_snowball_reward: Number(totalRewP2.toFixed(4)),
+  };
+}
+
 let battle = null;
+let battleMode = "single";
 let fog = null;
+let fogP2 = null;
 let playerPolicy = "conservative_nuzlocke";
 let fogOfWar = true;
 let rng = null;
 let totalReward = 0.0;
+let totalRewardP2 = 0.0;
 let prevSnap = null;
+let prevSnapP2 = null;
 let maxTurns = 120;
+
+function pendingH2HSides() {
+  if (!battle || battle.ended || battle.turn > maxTurns) return [];
+  const pending = [];
+  for (const [idx, tag] of [[0, "p1"], [1, "p2"]]) {
+    const side = battle.sides[idx];
+    const req = side.activeRequest;
+    if (req && !req.wait && !side.isChoiceDone()) {
+      const legal = buildLegalActions(battle, idx);
+      if (legal.length > 0) pending.push(tag);
+    }
+  }
+  return pending;
+}
+
+function buildH2HPayload(trappedSides = []) {
+  const pending = pendingH2HSides();
+  const legalP1 = pending.includes("p1") ? buildLegalActions(battle, 0) : [];
+  const legalP2 = pending.includes("p2") ? buildLegalActions(battle, 1) : [];
+  return {
+    ok: true,
+    mode: "h2h",
+    done: Boolean(battle.ended || battle.turn > maxTurns || pending.length === 0),
+    pending_sides: pending,
+    trapped_sides: trappedSides,
+    states: {
+      p1: projectStateForSide(battle, 0, fog, fogOfWar),
+      p2: projectStateForSide(battle, 1, fogP2, fogOfWar),
+    },
+    legal_actions: {
+      p1: legalP1,
+      p2: legalP2,
+    },
+    metrics: getH2HMetrics(battle, totalReward, totalRewardP2),
+  };
+}
 
 function commitP2Choice(battle, policy, rng) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -675,7 +741,7 @@ function advanceUntilAiDecisionOrEnd() {
     if (p2Needs) {
       if (!commitP2Choice(battle, playerPolicy, rng)) break;
       fog.sync(battle);
-      const nextSnap = snapReward(battle);
+      const nextSnap = snapReward(battle, 0);
       totalReward += computeStepReward(prevSnap, nextSnap);
       prevSnap = nextSnap;
     } else {
@@ -698,15 +764,17 @@ rl.on("line", (line) => {
   try {
     if (req.cmd === "init") {
       const seed = req.seed || [1, 2, 3, 4];
+      battleMode = req.mode === "h2h" ? "h2h" : "single";
       playerPolicy = req.player_policy || "conservative_nuzlocke";
       fogOfWar = req.fog_of_war !== false;
       maxTurns = req.max_turns || 120;
       rng = makePrng(seed);
       totalReward = 0.0;
+      totalRewardP2 = 0.0;
 
       battle = new Battle({ formatid: FORMAT, seed });
-      battle.setPlayer("p1", { name: "AI", team: Teams.pack(req.p1) });
-      battle.setPlayer("p2", { name: "Player", team: Teams.pack(req.p2) });
+      battle.setPlayer("p1", { name: battleMode === "h2h" ? "P1" : "AI", team: Teams.pack(req.p1) });
+      battle.setPlayer("p2", { name: battleMode === "h2h" ? "P2" : "Player", team: Teams.pack(req.p2) });
 
       // Assign stable immutable bench IDs before any switches reorder side.pokemon
       for (const side of battle.sides) {
@@ -716,14 +784,28 @@ rl.on("line", (line) => {
         });
       }
 
-      // Optional USUM Totem / Ultra Necrozma aura boosts on lead p1
+      // Optional USUM Totem / Ultra Necrozma aura boosts on lead p1 (and optional p2_aura)
       if (req.p1_aura && battle.sides[0].active[0]) {
         battle.boost(req.p1_aura, battle.sides[0].active[0], battle.sides[0].active[0], null, true);
       }
+      if (req.p2_aura && battle.sides[1].active[0]) {
+        battle.boost(req.p2_aura, battle.sides[1].active[0], battle.sides[1].active[0], null, true);
+      }
 
-      fog = new FogTracker(battle);
+      fog = new FogTracker(battle, 1);
       fog.sync(battle);
-      prevSnap = snapReward(battle);
+      prevSnap = snapReward(battle, 0);
+
+      if (battleMode === "h2h") {
+        fogP2 = new FogTracker(battle, 0);
+        fogP2.sync(battle);
+        prevSnapP2 = snapReward(battle, 1);
+        process.stdout.write(JSON.stringify(buildH2HPayload()) + "\n");
+        return;
+      }
+
+      fogP2 = null;
+      prevSnapP2 = null;
       advanceUntilAiDecisionOrEnd();
 
       const legal = battle.ended || battle.turn > maxTurns ? [] : buildLegalActions(battle, 0);
@@ -731,7 +813,7 @@ rl.on("line", (line) => {
         JSON.stringify({
           ok: true,
           done: Boolean(battle.ended || battle.turn > maxTurns || legal.length === 0),
-          state: projectState(battle, fog, fogOfWar),
+          state: projectStateForSide(battle, 0, fog, fogOfWar),
           legal_actions: legal,
           metrics: getMetrics(battle, totalReward),
         }) + "\n"
@@ -741,6 +823,44 @@ rl.on("line", (line) => {
 
     if (req.cmd === "step") {
       if (!battle) throw new Error("Battle not initialized");
+
+      if (battleMode === "h2h") {
+        const actions = req.actions || {};
+        const pending = pendingH2HSides();
+        const trappedSides = [];
+        const beforeTurn = battle.turn;
+        const beforeLogLen = battle.log.length;
+
+        for (const tag of pending) {
+          const sideIdx = tag === "p1" ? 0 : 1;
+          const actId = actions[tag];
+          const legal = buildLegalActions(battle, sideIdx);
+          const chosen = legal.find((a) => a.id === actId);
+          if (!chosen) {
+            process.stdout.write(JSON.stringify({ ok: false, error: `Illegal action_id ${actId} for ${tag}` }) + "\n");
+            return;
+          }
+          if (!battle.choose(tag, chosen.token)) {
+            trappedSides.push(tag);
+          }
+        }
+
+        // Sync fog & rewards whenever Showdown actually progressed the battle
+        if (battle.turn !== beforeTurn || battle.log.length !== beforeLogLen || battle.ended) {
+          fog.sync(battle);
+          fogP2.sync(battle);
+          const nextSnap1 = snapReward(battle, 0);
+          totalReward += computeStepReward(prevSnap, nextSnap1);
+          prevSnap = nextSnap1;
+          const nextSnap2 = snapReward(battle, 1);
+          totalRewardP2 += computeStepReward(prevSnapP2, nextSnap2);
+          prevSnapP2 = nextSnap2;
+        }
+
+        process.stdout.write(JSON.stringify(buildH2HPayload(trappedSides)) + "\n");
+        return;
+      }
+
       const legal = buildLegalActions(battle, 0);
       const chosen = legal.find((a) => a.id === req.action_id);
       if (!chosen) {
@@ -761,7 +881,7 @@ rl.on("line", (line) => {
             trapped_retry: true,
             done: Boolean(battle.ended || battle.turn > maxTurns || updatedLegal.length === 0),
             step_reward: 0.0,
-            state: projectState(battle, fog, fogOfWar),
+            state: projectStateForSide(battle, 0, fog, fogOfWar),
             legal_actions: updatedLegal,
             metrics: getMetrics(battle, totalReward),
           }) + "\n"
@@ -773,7 +893,7 @@ rl.on("line", (line) => {
         return;
       }
       fog.sync(battle);
-      const nextSnap = snapReward(battle);
+      const nextSnap = snapReward(battle, 0);
       totalReward += computeStepReward(prevSnap, nextSnap);
       prevSnap = nextSnap;
 
@@ -784,7 +904,7 @@ rl.on("line", (line) => {
           ok: true,
           done: Boolean(battle.ended || battle.turn > maxTurns || nextLegal.length === 0),
           step_reward: Number((totalReward - beforeRew).toFixed(4)),
-          state: projectState(battle, fog, fogOfWar),
+          state: projectStateForSide(battle, 0, fog, fogOfWar),
           legal_actions: nextLegal,
           metrics: getMetrics(battle, totalReward),
         }) + "\n"

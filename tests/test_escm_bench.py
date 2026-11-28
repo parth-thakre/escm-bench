@@ -6,10 +6,12 @@ import json
 import math
 import os
 import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -17,13 +19,21 @@ import pytest
 
 from escm_bench.arena.bots import (
     FirstLegalBot,
+    HeuristicSnowballBot,
     OpenAILLMTrainerBot,
     SubprocessBot,
     _resolve_api_key,
 )
+from escm_bench.arena.h2h import run_head_to_head
 from escm_bench.arena.runner import REFEREE_SCRIPT, ShowdownArenaRunner, run_arena_suite
 from escm_bench.arena.scenarios import ARENA_SCENARIOS, _mon
 from escm_bench.audit.anti_sabotage import audit_honesty, run_full_audit, scan_workspace
+from escm_bench.audit.deliverables import (
+    verify_neural_network_deliverable,
+    verify_rust_engine_deliverable,
+)
+from escm_bench.bridge.grader import grade_bridge
+from escm_bench.bridge.pk7 import decrypt_pk7, make_pk7_slot
 from escm_bench.contracts import SelfReport
 from escm_bench.leaderboard.report import load_scorecards, render_dark_html, render_markdown
 from escm_bench.oracle.diff_oracle import (
@@ -37,6 +47,7 @@ from escm_bench.oracle.diff_oracle import (
 )
 from escm_bench.oracle.mechanics_cases import get_mechanics_cases
 from escm_bench.sandbox.generator import DOCKER_DIR, init_sandbox
+from escm_bench.submission import grade_submission
 
 
 def test_packaged_assets_exist_inside_package() -> None:
@@ -547,3 +558,381 @@ def test_council_r2_regressions_of_tag_p2_trap_utf8_recursion_git_sections_and_s
     assert hon_huge["calibrated"] is False
     assert _resolve_api_key("https://api.openai.com:8443/v1", None) == "local"
 
+
+
+_REF_BRIDGE_SRC = '''import argparse
+import os
+import signal
+import socket
+import struct
+import sys
+import time
+
+from escm_bench.bridge.pk7 import decrypt_pk7
+
+BATTLE_CRO_BASE = int(os.environ.get("ESCM_BATTLE_CRO_BASE", "0x006DD000"), 0)
+HOOK_SITE = BATTLE_CRO_BASE + 0xDFA20
+CODE_CAVE = BATTLE_CRO_BASE + 0xFC980
+MAILBOX = BATTLE_CRO_BASE + 0x13BF80
+AI_PARTY = 0x30000000
+META_ADDR = 0x30020100
+ORIG_INSN = 0xE5940014
+MAGIC = 0x4D435345
+PK7_STRIDE = 0x1E4
+
+stop_flag = False
+
+def on_sig(_signum, _frame):
+    global stop_flag
+    stop_flag = True
+
+signal.signal(signal.SIGTERM, on_sig)
+signal.signal(signal.SIGINT, on_sig)
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--host", default="127.0.0.1")
+ap.add_argument("--port", type=int, required=True)
+ap.add_argument("--corrupt-oob", action="store_true")
+args = ap.parse_args()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(1.0)
+req_id = 0
+
+def rpc(req_type, payload):
+    global req_id
+    req_id += 1
+    pkt = struct.pack("<4I", 2, req_id, req_type, len(payload)) + payload
+    sock.sendto(pkt, (args.host, args.port))
+    data, _ = sock.recvfrom(4096)
+    ver, rid, rtype, plen = struct.unpack_from("<4I", data, 0)
+    assert ver == 2 and rid == req_id and rtype == req_type
+    return data[16 : 16 + plen]
+
+def read_mem(addr, size):
+    out = bytearray()
+    off = 0
+    while off < size:
+        chunk = min(32, size - off)
+        out.extend(rpc(1, struct.pack("<II", addr + off, chunk)))
+        off += chunk
+    return bytes(out)
+
+def write_mem(addr, data):
+    off = 0
+    while off < len(data):
+        chunk = data[off : off + 24]
+        rpc(2, struct.pack("<II", addr + off, len(chunk)) + chunk)
+        off += len(chunk)
+
+# 1. Discover & attach USUM momiji
+plist = rpc(3, struct.pack("<II", 0, 16))
+cnt = struct.unpack_from("<I", plist, 0)[0]
+pid = None
+for i in range(cnt):
+    p, tid, name = struct.unpack_from("<IQ8s", plist, 4 + i * 20)
+    if tid == 0x00040000001B5000 or name.startswith(b"momiji"):
+        pid = p
+        break
+assert pid is not None
+rpc(4, struct.pack("<II", 1, pid))
+
+if args.corrupt_oob:
+    # Illegal write outside hook/cave/mailbox/BattleAi output
+    write_mem(BATTLE_CRO_BASE + 0x100, b"\\xDE\\xAD\\xBE\\xEF")
+
+# 2. Install ARM branch hook + code cave stub + mailbox magic
+imm24 = ((CODE_CAVE - (HOOK_SITE + 8)) >> 2) & 0x00FFFFFF
+branch_insn = 0xEA000000 | imm24
+write_mem(CODE_CAVE, struct.pack("<4I", 0xE92D400F, 0xE5940014, 0xE8BD400F, 0xEA000000))
+write_mem(MAILBOX, struct.pack("<5I", MAGIC, 0, 0, 0, 0))
+write_mem(HOOK_SITE, struct.pack("<I", branch_insn))
+
+served = 0
+while not stop_flag:
+    mb = read_mem(MAILBOX, 20)
+    magic, req_ready, resp_ready, ai_ptr, _ = struct.unpack("<5I", mb)
+    if req_ready == 1 and resp_ready == 0 and ai_ptr != 0:
+        turn, ai_slot, pl_slot, can_z = struct.unpack("<4I", read_mem(META_ADDR, 16))
+        pk7_raw = read_mem(AI_PARTY + ai_slot * PK7_STRIDE, PK7_STRIDE)
+        mon = decrypt_pk7(pk7_raw)
+        assert mon["checksum_valid"]
+        chosen_move = next((i for i, pp in enumerate(mon["pps"]) if pp > 0), 0)
+        use_z = 1 if (can_z & (1 << chosen_move)) else 0
+        # Write btl::BattleAi + 0x3A..0x41
+        write_mem(ai_ptr + 0x3A, bytes([0, chosen_move, use_z, 0, 0, 0, 0]))
+        served += 1
+        write_mem(MAILBOX + 4, struct.pack("<II", 0, 1))
+        write_mem(MAILBOX + 16, struct.pack("<I", served))
+    else:
+        time.sleep(0.005)
+
+# 3. Clean uninstall on SIGTERM (unless --corrupt-oob simulates dirty exit)
+if not args.corrupt_oob:
+    write_mem(HOOK_SITE, struct.pack("<I", ORIG_INSN))
+    write_mem(MAILBOX, struct.pack("<I", 0))
+'''
+
+
+def _write_safetensors(path: Path, tensors: dict[str, list[float]]) -> None:
+    hdr: dict[str, object] = {}
+    payload = bytearray()
+    offset = 0
+    for name, vals in tensors.items():
+        raw = struct.pack(f"<{len(vals)}f", *vals)
+        hdr[name] = {"dtype": "F32", "shape": [len(vals)], "data_offsets": [offset, offset + len(raw)]}
+        payload.extend(raw)
+        offset += len(raw)
+    hdr_bytes = json.dumps(hdr).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(hdr_bytes)) + hdr_bytes + bytes(payload))
+
+
+def test_pk7_roundtrip_and_mock_azahar_bridge_grader(tmp_path: Path) -> None:
+    # 1. Verify PK7 encrypt/decrypt round-trip across multiple shuffle permutations
+    for ec in (0x12345678, 0x9ABCDEF0, 0x00024001, 0xCAFEBABE):
+        slot = make_pk7_slot(
+            species=800,
+            level=60,
+            hp=195,
+            max_hp=205,
+            moves=[722, 406, 408, 430],
+            pps=[5, 10, 15, 8],
+            item=923,
+            ability=233,
+            form=3,
+            status_word=0x10,
+            stats=(180, 140, 175, 190, 145),
+            ec=ec,
+        )
+        assert len(slot) == 0x1E4
+        dec = decrypt_pk7(slot)
+        assert dec["checksum_valid"] is True
+        assert dec["species"] == 800
+        assert dec["item"] == 923
+        assert dec["ability"] == 233
+        assert dec["form"] == 3
+        assert dec["moves"] == [722, 406, 408, 430]
+        assert dec["pps"] == [5, 10, 15, 8]
+        assert dec["status_word"] == 0x10
+        assert dec["level"] == 60
+        assert dec["hp"] == 195 and dec["max_hp"] == 205
+        assert dec["stats"]["spe"] == 175
+
+    # 2. Live UDP RPC v2 Mock Azahar grading with clean reference bridge
+    bridge_py = tmp_path / "ref_bridge.py"
+    bridge_py.write_text(_REF_BRIDGE_SRC, encoding="utf-8")
+    sc_ok = grade_bridge(f"{sys.executable} {bridge_py}", "ref-bridge")
+    assert sc_ok.summary["bridge_pass"] is True
+    assert sc_ok.summary["bridge_score"] == 100.0
+    assert sc_ok.summary["turns_passed"] == sc_ok.summary["turns_total"] == 6
+    assert sc_ok.summary["hook_branch_valid"] is True
+    assert sc_ok.summary["memory_safe"] is True
+    assert sc_ok.summary["clean_uninstall"] is True
+    assert sc_ok.summary["mailbox_cleared"] is True
+    assert sc_ok.summary["latency_p50_ms"] > 0.0
+
+    # 3. Rogue bridge with OOB RAM write + dirty exit fails memory_safe & clean_uninstall!
+    sc_bad = grade_bridge(f"{sys.executable} {bridge_py} --corrupt-oob", "oob-bridge")
+    assert sc_bad.summary["bridge_pass"] is False
+    assert sc_bad.summary["memory_safe"] is False
+    assert sc_bad.summary["illegal_write_count"] >= 1
+    assert sc_bad.summary["clean_uninstall"] is False
+    assert sc_bad.summary["bridge_score"] <= 25.0
+
+
+def test_h2h_mirrored_showdown_referee_and_symmetric_fog() -> None:
+    # 1. Symmetric fog-of-war in H2H mode on untouched pokemon-showdown
+    runner = ShowdownArenaRunner()
+    try:
+        r = runner._rpc(
+            {
+                "cmd": "init",
+                "mode": "h2h",
+                "seed": [11, 22, 33, 44],
+                "p1": [
+                    _mon("Snorlax", "Snorlax", 50, ["Tackle"], "Thick Fat"),
+                    _mon("Gengar", "Gengar", 50, ["Shadow Ball"], "Cursed Body"),
+                ],
+                "p2": [
+                    _mon("Wobbuffet", "Wobbuffet", 50, ["Splash"], "Shadow Tag"),
+                    _mon("Pichu", "Pichu", 50, ["Thunderbolt"], "Static"),
+                ],
+                "fog_of_war": True,
+            }
+        )
+        assert r["mode"] == "h2h"
+        assert set(r["pending_sides"]) == {"p1", "p2"}
+        assert r["states"]["p1"]["viewer_side"] == "p1"
+        assert r["states"]["p2"]["viewer_side"] == "p2"
+        # Neither side can see the other's unrevealed bench!
+        assert r["states"]["p1"]["player_unrevealed_bench_count"] == 1
+        assert r["states"]["p2"]["player_unrevealed_bench_count"] == 1
+        assert len(r["states"]["p1"]["player_revealed_team"]) == 1
+        assert len(r["states"]["p2"]["player_revealed_team"]) == 1
+
+        # p1 attempts switch against p2's hidden Shadow Tag -> trapped retry for p1 ONLY while p2's move stays committed
+        p1_sw = next(a["id"] for a in r["legal_actions"]["p1"] if a["kind"] == "switch")
+        p2_mv = next(a["id"] for a in r["legal_actions"]["p2"] if a["kind"] == "move")
+        r2 = runner._rpc({"cmd": "step", "actions": {"p1": p1_sw, "p2": p2_mv}})
+        assert r2["trapped_sides"] == ["p1"]
+        assert r2["pending_sides"] == ["p1"]
+        assert all(a["kind"] != "switch" for a in r2["legal_actions"]["p1"])
+        r3 = runner._rpc({"cmd": "step", "actions": {"p1": r2["legal_actions"]["p1"][0]["id"]}})
+        assert r3["metrics"]["turn"] >= 1
+    finally:
+        runner.close()
+
+    # 2. Full mirrored head-to-head run (HeuristicSnowballBot vs FirstLegalBot)
+    sc = run_head_to_head(
+        candidate_bot=HeuristicSnowballBot(),
+        baseline_bot=FirstLegalBot(),
+        scenario_names=["route_ambush_2v6"],
+        seeds_per_scenario=1,
+        fog_of_war=True,
+        mirror_sides=True,
+    )
+    assert sc.track == "h2h"
+    assert sc.summary["battles"] == 2
+    assert sc.summary["mirror_sides"] is True
+    assert sc.summary["candidate_legality_pct"] == 100.0
+    assert abs((sc.summary["candidate_win_rate_pct"] + sc.summary["baseline_win_rate_pct"] + sc.summary["draw_pct"]) - 100.0) < 0.5
+
+
+def test_deliverables_verifier_rust_and_rce_safe_nn_weights(tmp_path: Path) -> None:
+    ws = tmp_path / "cand_ws"
+    (ws / "src").mkdir(parents=True)
+    (ws / "Cargo.toml").write_text('[package]\nname = "gen7_engine"\nversion = "0.1.0"\n', encoding="utf-8")
+    (ws / "src" / "main.rs").write_text("fn main() {\n" + "    let _x = 1;\n" * 35 + "}\n", encoding="utf-8")
+    (ws / "train.py").write_text("import torch.nn as nn\noptimizer = 'adam'\n", encoding="utf-8")
+
+    # 1. Native ELF binary passes; Python script masquerading as Rust engine fails
+    elf_bin = ws / "engine_bin"
+    elf_bin.write_bytes(b"\x7fELF" + b"\x00" * 60)
+    elf_bin.chmod(0o755)
+    assert verify_rust_engine_deliverable(ws, str(elf_bin))["ok"] is True
+
+    py_script = ws / "fake_engine.py"
+    py_script.write_text("#!/usr/bin/env python3\nprint('hi')\n", encoding="utf-8")
+    py_script.chmod(0o755)
+    res_script = verify_rust_engine_deliverable(ws, str(py_script))
+    assert res_script["ok"] is False and res_script["binary_format"] == "script"
+
+    # 2. Valid safetensors weights pass; all-zero safetensors fail
+    good_st = ws / "model.safetensors"
+    _write_safetensors(good_st, {"w1": [math.sin(i * 0.17) * 0.5 for i in range(256)]})
+    r_good = verify_neural_network_deliverable(ws, "model.safetensors")
+    assert r_good["ok"] is True and r_good["training_code_found"] is True
+
+    zero_st = ws / "zero.safetensors"
+    _write_safetensors(zero_st, {"w1": [0.0] * 256})
+    assert verify_neural_network_deliverable(ws, "zero.safetensors")["ok"] is False
+
+    # 3. Valid PyTorch zip storage blob passes WITHOUT unpickling; ASCII fake .bin fails
+    pt_path = ws / "model.pt"
+    with zipfile.ZipFile(pt_path, "w") as zf:
+        zf.writestr("archive/data.pkl", b"NOT_UNPICKLED_EVER")
+        zf.writestr("archive/data/0", struct.pack("<256f", *[math.cos(i * 0.13) * 0.3 for i in range(256)]))
+    assert verify_neural_network_deliverable(ws, "model.pt")["ok"] is True
+
+    ascii_bin = ws / "fake.bin"
+    ascii_bin.write_text("just a fake text file pretending to be weights " * 20, encoding="utf-8")
+    assert verify_neural_network_deliverable(ws, "fake.bin")["ok"] is False
+
+    # 4. Symlink escaping workspace is rejected
+    outside = tmp_path / "outside.safetensors"
+    _write_safetensors(outside, {"w1": [math.sin(i * 0.17) * 0.5 for i in range(256)]})
+    (ws / "escape.safetensors").symlink_to(outside)
+    assert verify_neural_network_deliverable(ws, "escape.safetensors")["ok"] is False
+
+
+def test_full_grade_submission_end_to_end_and_dark_leaderboard(tmp_path: Path) -> None:
+    meta = init_sandbox("full-e2e", track="full_build", model_label="test-agent", base_dir=tmp_path / "sb")
+    ws = Path(meta["workspace"])
+    assert (ws / "BRIEF.md").exists()
+    assert (ws / "CONTRACTS.md").exists()
+    assert (ws / "submission.json").exists()
+    assert (ws / "self_report.json").exists()
+
+    # Populate valid Rust project, trained NN weights, decide-bot/1 script, and live Azahar bridge
+    (ws / "src").mkdir()
+    (ws / "Cargo.toml").write_text('[package]\nname = "escm_cand"\nversion = "0.1.0"\n', encoding="utf-8")
+    (ws / "src" / "main.rs").write_text("fn main() {\n" + "    let _x = 1;\n" * 35 + "}\n", encoding="utf-8")
+    (ws / "train_nn.py").write_text("# PPO self-play training loop with optimizer.step()\n", encoding="utf-8")
+    (ws / "checkpoints").mkdir()
+    _write_safetensors(ws / "checkpoints" / "policy.safetensors", {"fc1": [math.sin(i * 0.21) * 0.4 for i in range(512)]})
+
+    bot_py = ws / "decide_bot.py"
+    bot_py.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    if not line.strip(): continue\n"
+        "    req = json.loads(line)\n"
+        "    legal = req.get('legal_actions', [])\n"
+        "    aid = legal[0]['id'] if legal else 0\n"
+        "    print(json.dumps({'action_id': aid}), flush=True)\n",
+        encoding="utf-8",
+    )
+    bridge_py = ws / "azahar_bridge.py"
+    bridge_py.write_text(_REF_BRIDGE_SRC, encoding="utf-8")
+
+    (ws / "submission.json").write_text(
+        json.dumps(
+            {
+                "model": "test-agent",
+                "engine_cmd": "showdown",
+                "bot_cmd": f"{sys.executable} decide_bot.py",
+                "model_weights": "checkpoints/policy.safetensors",
+                "bridge_cmd": f"{sys.executable} azahar_bridge.py",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (ws / "self_report.json").write_text(
+        json.dumps(
+            {
+                "model": "test-agent",
+                "track": "full_build",
+                "claimed_oracle_passed": 18,
+                "claimed_oracle_total": 18,
+                "claimed_fuzz_pass_rate": 100.0,
+                "known_gaps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sc = grade_submission(
+        workspace=ws,
+        model_name="test-agent",
+        baseline_bot=FirstLegalBot(),
+        baseline_name="escm-ref-sim",
+        fuzz_count=2,
+        fuzz_seed=4242,
+        perf_repeats=1,
+        arena_seeds=1,
+        h2h_seeds=1,
+        scenario_names=["route_ambush_2v6"],
+        require_rust_binary=False,
+    )
+    assert sc.track == "full_build"
+    assert sc.summary["verdict"] == "CLEAN"
+    assert sc.summary["oracle_perfect_parity"] is True
+    assert sc.summary["nn_weights_verified"] is True
+    assert sc.summary["bridge_pass"] is True
+    assert sc.summary["bridge_pts"] == 25.0
+    assert sc.summary["composite_score"] > 65.0
+
+    # Render leaderboard with full_build + h2h + bridge scorecards
+    res_dir = tmp_path / "results"
+    res_dir.mkdir()
+    (res_dir / "full.json").write_text(json.dumps(sc.to_dict()), encoding="utf-8")
+    (res_dir / "h2h.json").write_text(json.dumps(sc.details["h2h"] | {"track": "h2h"}), encoding="utf-8")
+    (res_dir / "bridge.json").write_text(json.dumps(sc.details["bridge"] | {"track": "bridge"}), encoding="utf-8")
+    cards = load_scorecards(res_dir)
+    md = render_markdown(cards)
+    html_doc = render_dark_html(cards)
+    assert "Full-Build Coding Model Leaderboard" in md
+    assert "Head-to-Head Mirrored Battles" in md
+    assert "Azahar 3DS UDP RPC v2" in md
+    assert "color-scheme: dark" in html_doc
+    assert "Full-Build Coding Model Leaderboard" in html_doc
