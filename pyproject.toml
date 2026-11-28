@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "escm-bench"
+version = "0.1.0"
+description = "Multi-track benchmark suite for Gen 7 Pokemon USUM engines, Snowball trainer AIs, and anti-sabotage coding agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+escm-bench = "escm_bench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["escm_bench*"]
+
+[tool.setuptools.package-data]
+escm_bench = ["assets/referee/*.cjs", "assets/docker/Dockerfile.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,21 @@
+# Isolated build sandbox for Track 2 / Track 3 / Track 5 coding agents.
+# Includes nodejs so agents can consult /opt/ref/pokemon-showdown:ro as a dev rules oracle.
+# Note: Dockerfile.grade intentionally OMITS nodejs and pokemon-showdown.
+# Zero access to private repos, git credentials, or hidden benchmark tests.
+FROM rust:1.85-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv nodejs git pkg-config build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /workspace /opt/ref /tmp/bench-home/.cargo \
+    && chmod 1777 /workspace /tmp/bench-home /tmp/bench-home/.cargo
+
+WORKDIR /workspace
+
+ENV HOME=/tmp/bench-home \
+    CARGO_HOME=/tmp/bench-home/.cargo \
+    NODE_PATH=/opt/ref/node_modules \
+    GIT_TERMINAL_PROMPT=0 \
+    PYTHONDONTWRITEBYTECODE=1
+
+CMD ["/bin/bash"]
